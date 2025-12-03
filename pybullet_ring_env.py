@@ -125,6 +125,12 @@ class RingPickPlaceEnv(gym.Env):
         self.ring_ids = []              # list of ring body ids (one per tentacle)
         self.spawn_zone_center = np.array([0.35, -0.35, 0.06])  # where rings spawn (near gripper)
         self.spawn_zone_size = np.array([0.1, 0.2, 0.02])      # region dims for ring spawn
+        
+        # bookkeeping for reward / grip tracking
+        self._last_grip = 0.0        # track previous grip value (for toggle penalty)
+        self._hold_reward_per_step = 0.02  # small per-step reward while holding
+        self._toggle_penalty = 0.05        # small penalty when grip sign toggles quickly
+
 
         # agent / gripper state
         self.holding = False
@@ -132,8 +138,8 @@ class RingPickPlaceEnv(gym.Env):
         self.held_ring_id = None
 
         # control params
-        self.max_delta = 0.04  # max meters per action step
-        self.grasp_distance = 0.08
+        self.max_delta = 0.06  # max meters per action step
+        self.grasp_distance = 0.12
         self.place_distance = 0.06
         self.success_reward = 5.0
 
@@ -362,81 +368,213 @@ class RingPickPlaceEnv(gym.Env):
 
     # ---------------- main Gym API ----------------
     def step(self, action):
+        """
+        Updated step() with:
+        - grip hysteresis/persistence (prevents flicker)
+        - explicit grasp_attempt bonus and small far-grip penalty
+        - safer reward scaling / workspace normalization
+        - retains sequential behavior (approach -> grasp -> place)
+        """
+
+        # ---------- lazy trackers (unchanged) ----------
+        if not hasattr(self, "prev_nearest_d"):
+            self.prev_nearest_d = None
+        if not hasattr(self, "prev_ring_to_target"):
+            self.prev_ring_to_target = None
+        if not hasattr(self, "last_grip"):
+            self.last_grip = 0.0
+        if not hasattr(self, "step_count"):
+            self.step_count = 0
+        if not hasattr(self, "debug"):
+            self.debug = False  # enable externally
+        if not hasattr(self, "grip_state"):
+            # grip_state: False=open, True=closed (logical state used by env, independent of raw action)
+            self.grip_state = False
+            self.grip_counter = 0
+
+        self.step_count += 1
+
+        # --- clip action & compute desired EE pos ---
         action = np.clip(action, -1.0, 1.0)
-        dx, dy, dz, grip = action
+        dx, dy, dz, grip_raw = action
         delta = np.array([dx, dy, dz], dtype=np.float32) * self.max_delta
 
         ee_pos, ee_orn = self._get_ee_pose()
         target_pos = ee_pos + delta
         target_pos = np.clip(target_pos, self.workspace_low, self.workspace_high)
 
-        # IK
+        # IK -> set joint targets
         target_joints = p.calculateInverseKinematics(self.kuka, self.ee_link_index, target_pos, maxNumIterations=20)
         for j in range(len(target_joints)):
-            p.setJointMotorControl2(bodyUniqueId=self.kuka, jointIndex=j, controlMode=p.POSITION_CONTROL, targetPosition=target_joints[j], force=200)
+            p.setJointMotorControl2(bodyUniqueId=self.kuka,
+                                    jointIndex=j,
+                                    controlMode=p.POSITION_CONTROL,
+                                    targetPosition=target_joints[j],
+                                    force=200)
 
         for _ in range(self.frame_skip):
             p.stepSimulation()
             if self.gui:
                 time.sleep(self.timestep)
 
-        # grasp logic: detect nearest ring within grasp_distance
+        # --- nearest ring detection (safe) ---
         ee_pos, ee_orn = self._get_ee_pose()
         nearest_ring = None
         nearest_d = 1e6
         for rid in self.ring_ids:
-            rpos, _ = p.getBasePositionAndOrientation(rid)
-            d = np.linalg.norm(np.array(rpos) - ee_pos)
+            try:
+                rpos, _ = p.getBasePositionAndOrientation(rid)
+            except Exception:
+                continue
+            d = np.linalg.norm(np.array(rpos) - ee_pos)   # includes z
             if d < nearest_d:
                 nearest_d = d
                 nearest_ring = rid
 
-        if grip > 0.0:
-            if (not self.holding) and nearest_ring is not None and nearest_d < self.grasp_distance:
-                self._attach_ring(nearest_ring)
-        else:
-            if self.holding:
-                # if close to any tentacle top and color matches -> success reward
-                self._release_ring()
+        # -------- grip hysteresis / persistence --------
+        # thresholds: tune these if needed
+        grip_close_threshold = 0.3   # raw action above this considered "try close" (in [-1,1] scale)
+        grip_open_threshold  = -0.3  # raw action below this considered "try open"
+        grip_persist_steps   = 3     # require N consecutive steps to flip state (debounce)
+        attached_now = False
 
-        # build observation
+        # interpret raw grip action -> desired toggle intent
+        if grip_raw >= grip_close_threshold:
+            # intent to close
+            if self.grip_state is False:
+                self.grip_counter += 1
+                if self.grip_counter >= grip_persist_steps:
+                    # attempt to close
+                    # only attach if not already holding and ring within grasp_distance
+                    if (not self.holding) and (nearest_ring is not None) and (nearest_d < self.grasp_distance):
+                        self._attach_ring(nearest_ring)
+                        attached_now = True
+                    # flip logical state regardless of attach success to represent closed gripper
+                    self.grip_state = True
+                    self.grip_counter = 0
+            else:
+                # already closed; reset counter
+                self.grip_counter = 0
+
+        elif grip_raw <= grip_open_threshold:
+            # intent to open
+            if self.grip_state is True:
+                self.grip_counter += 1
+                if self.grip_counter >= grip_persist_steps:
+                    # release if holding
+                    if self.holding:
+                        self._release_ring()
+                    self.grip_state = False
+                    self.grip_counter = 0
+            else:
+                self.grip_counter = 0
+        else:
+            # in neutral band -> don't count toward flips
+            self.grip_counter = 0
+
+        # --- build obs (unchanged) ---
         obs = self._get_obs()
 
-        # reward shaping: encourage approach & placement
+        # ---------- reward shaping: tuned, sequential ----------
         reward = 0.0
         done = False
         info = {}
-        # if holding: compute distance ring -> matching target if known
-        if self.holding and self.held_ring_id is not None:
-            # find which tentacle this ring corresponds to (we keep ring order aligned)
+
+        # normalization factor
+        workspace_diag = np.linalg.norm(self.workspace_high - self.workspace_low) + 1e-8
+
+        # init prev distances
+        if self.prev_nearest_d is None:
+            self.prev_nearest_d = nearest_d
+        if self.prev_ring_to_target is None:
+            # if holding, will be set later when appropriate
+            self.prev_ring_to_target = None
+
+        # Tunable coefficients (start conservative; adjust by small factors)
+        coef_delta_approach = 5.0    # reward for reducing distance to ring (per-step)
+        coef_abs_shaping   = -1.5    # mild negative for remaining distance (keeps pressure but not dominant)
+        grasp_success_bonus = 6.0    # bonus when a close, intended close actually attached
+        far_grip_penalty = -0.25     # small penalty for closing when ring far
+        holding_per_step_bonus = 0.05 # small per-step reward while holding ring
+
+        # --- not holding: encourage approach & sensible closes only when near ---
+        if not self.holding:
+            # approach: positive when nearest_d decreases (i.e., we moved closer)
+            delta_d = (self.prev_nearest_d - nearest_d)
+            reward += coef_delta_approach * (delta_d / workspace_diag)
+
+            # small shaping towards absolute closeness (kept mild)
+            reward += coef_abs_shaping * (nearest_d / workspace_diag)
+
+            # grip-related incentives:
+            # if logical grip_state transitioned to closed *and* we attached this step, huge positive
+            if attached_now:
+                reward += grasp_success_bonus
+
+            # if agent attempted to close (grip_state True) but ring was not close enough, small penalty
+            # we detect "attempt" as raw grip action being in close band; we use small penalty so agent explores
+            if (grip_raw >= grip_close_threshold) and (nearest_d > (self.grasp_distance * 1.25)):
+                reward += far_grip_penalty
+
+        else:
+            # holding: reward approach-to-target and small per-step bonus for holding
             try:
-                idx = self.ring_ids.index(self.held_ring_id)
+                if self.held_ring_id in self.ring_ids:
+                    idx = self.ring_ids.index(self.held_ring_id)
+                else:
+                    idx = None
             except ValueError:
                 idx = None
-            if idx is not None and idx < len(self.tentacle_top_positions):
+
+            if (idx is not None) and (idx < len(self.tentacle_top_positions)):
                 ring_pos, _ = p.getBasePositionAndOrientation(self.held_ring_id)
-                tpos = self.tentacle_top_positions[idx]
-                d = np.linalg.norm(np.array(ring_pos) - np.array(tpos))
-                reward += -d  # encourage closer
-                if (d < self.place_distance) and (grip <= 0.0):
+                tpos = np.array(self.tentacle_top_positions[idx])
+                d_to_target = np.linalg.norm(np.array(ring_pos) - tpos)
+
+                if self.prev_ring_to_target is None:
+                    self.prev_ring_to_target = d_to_target
+
+                delta_target = (self.prev_ring_to_target - d_to_target)
+                # encourage reducing ring -> tentacle distance
+                reward += 2.0 * (delta_target / workspace_diag)
+
+                # small shaping against remaining distance
+                reward += -0.5 * (d_to_target / workspace_diag)
+
+                # per-step holding bonus so keeping the ring is mildly rewarded
+                reward += holding_per_step_bonus
+
+                # success when placed & then opened
+                if (d_to_target < self.place_distance) and (not self.grip_state):
                     reward += self.success_reward
                     done = True
                     info['success'] = True
-        else:
-            # no holding: encourage end-effector -> nearest ring distance decrease
-            if nearest_ring is not None:
-                rpos, _ = p.getBasePositionAndOrientation(nearest_ring)
-                d = np.linalg.norm(np.array(rpos) - ee_pos)
-                reward += -d
 
-        # small time penalty
-        reward -= 0.01
+                # update prev tracker
+                self.prev_ring_to_target = d_to_target
 
-        # Gymnasium-style return: (obs, reward, terminated, truncated, info)
-        # Here `terminated` indicates episode ended by success/failure, `truncated` indicates time-limit or external stop.
+            else:
+                # can't find matching tentacle — small negative to nudge movement
+                reward += -0.1
+
+        # small time penalty to encourage speed (keep tiny)
+        reward -= 0.002
+
+        # update trackers
+        self.prev_nearest_d = nearest_d
+        self.last_grip = float(grip_raw)
+
+        # Debug prints
+        if self.debug and (self.step_count % 50 == 0):
+            print(f"[DEBUG] step {self.step_count} act_raw={action} nearest_d={nearest_d:.4f} grip_raw={grip_raw:.3f}"
+                f" grip_state={self.grip_state} attached_now={attached_now} holding={self.holding} reward={reward:.4f}")
+
         terminated = bool(done)
         truncated = False
         return obs.astype(np.float32), float(reward), terminated, truncated, info
+
+
+
 
 
     def _get_obs(self):
@@ -470,6 +608,23 @@ class RingPickPlaceEnv(gym.Env):
                 color_idx = -1.0
             slots.append(np.concatenate([tpos, rpos, np.array([color_idx], dtype=np.float32)]))
         slots = np.concatenate(slots).astype(np.float32)
+
+        # compute nearest_d (include z)
+        nearest_d = 1e6
+        for rid in self.ring_ids:
+            try:
+                rpos, _ = p.getBasePositionAndOrientation(rid)
+            except Exception:
+                continue
+            d = np.linalg.norm(np.array(rpos) - ee_pos)
+            if d < nearest_d:
+                nearest_d = d
+        if nearest_d == 1e6:
+            nearest_d = 0.0
+        # then append nearest_d and holding flag:
+        extra = np.array([nearest_d, 1.0 if self.holding else 0.0], dtype=np.float32)
+        # and include `extra` into the final obs concat.
+
 
         obs = np.concatenate([angles, vels, ee_pos.astype(np.float32), ee_orn.astype(np.float32), slots])
         return obs
@@ -559,7 +714,7 @@ class RingPickPlaceEnv(gym.Env):
         return self._get_obs().astype(np.float32), {}
 
     # ---------------- camera ----------------
-    def _set_camera(self, distance=0.6, yaw=60, pitch=-30, target=None):
+    def _set_camera(self, distance=0.8, yaw=60, pitch=-30, target=None):
         if target is None:
             target = [(self.workspace_low[0] + self.workspace_high[0]) / 2.0, 0.0, 0.1]
         p.resetDebugVisualizerCamera(cameraDistance=distance,
