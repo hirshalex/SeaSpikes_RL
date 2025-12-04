@@ -51,6 +51,9 @@ if __name__ == "__main__":
     episode = 0
     step = 0
     ep_reward = 0
+    
+    # Track gripper state changes for diagnosis
+    was_holding = False
 
     try:
         while episode < 3:  # Run 3 episodes
@@ -77,10 +80,35 @@ if __name__ == "__main__":
             
             holding = base_env.holding
             
+            # ============================================
+            # GRIPPER STATE CHANGE DETECTION
+            # ============================================
+            if holding and not was_holding:
+                print(f"\n{'='*60}")
+                print(f"[GRASP] Step {step}: Successfully attached ring!")
+                print(f"  Grip action: {grip:.3f}")
+                print(f"  Distance when grasped: {nearest_d:.3f}")
+                print(f"{'='*60}\n")
+            
+            if was_holding and not holding:
+                print(f"\n{'='*60}")
+                if grip < -0.5:
+                    print(f"[RELEASE] Step {step}: Intentional release")
+                    print(f"  Grip action: {grip:.3f} (trying to open)")
+                else:
+                    print(f"[DROP] Step {step}: ACCIDENTAL DROP!")
+                    print(f"  Grip action: {grip:.3f} (NOT trying to open)")
+                    print(f"  Action magnitude: {np.linalg.norm([dx, dy, dz]):.3f}")
+                    print(f"  → Likely cause: {'Jerky movement broke physics' if np.linalg.norm([dx, dy, dz]) > 0.7 else 'Gripper logic issue'}")
+                print(f"{'='*60}\n")
+            
+            was_holding = holding
+            
             # Print detailed info every 20 steps
             if step % 20 == 0:
                 print(f"\n--- Step {step} ---")
                 print(f"  Action: dx={dx:.3f}, dy={dy:.3f}, dz={dz:.3f}, grip={grip:.3f}")
+                print(f"  Action magnitude: {np.linalg.norm([dx, dy, dz]):.3f}")
                 print(f"  EE Position: [{ee_pos[0]:.3f}, {ee_pos[1]:.3f}, {ee_pos[2]:.3f}]")
                 print(f"  Distance to ring: {nearest_d:.3f}")
                 print(f"  Holding: {holding}")
@@ -96,6 +124,13 @@ if __name__ == "__main__":
                         print(f"    ❌ But too far from ring (need < {base_env.grasp_distance:.3f})")
                 if grip < -0.5:
                     print(f"  ✓ Trying to OPEN gripper")
+                    if holding:
+                        print(f"    ⚠️  Opening while holding (will drop ring)")
+                
+                if holding:
+                    action_mag = np.linalg.norm([dx, dy, dz])
+                    if action_mag > 0.7:
+                        print(f"  ⚠️  Large action while holding ({action_mag:.3f}) - risk of dropping!")
                 
                 if nearest_d > 0.3:
                     print(f"  ⚠️  Agent is far from ring - approach phase failing")

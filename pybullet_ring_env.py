@@ -531,11 +531,16 @@ class RingPickPlaceEnv(gym.Env):
                 target_reward = np.exp(-3.0 * dist_to_target)
                 reward += 3.0 * target_reward
                 
-                # 8. HOLDING BONUS (NEW!)
-                # Reward for keeping the ring (prevents dropping)
-                reward += 0.1  # Per-step bonus for maintaining grasp
+                # 8. HOLDING BONUS (per-step reward for maintaining grasp)
+                reward += 0.1
                 
-                # 9. GRIPPER BEHAVIOR WHILE HOLDING (NEW!)
+                # 9. SMOOTHNESS REWARD - penalize large actions while holding
+                # This prevents violent movements that break the grip
+                action_magnitude = np.linalg.norm([dx, dy, dz])
+                if action_magnitude > 0.7:  # Large movements
+                    reward -= 0.5 * (action_magnitude - 0.7)  # Penalty for jerky motion
+                
+                # 10. GRIPPER BEHAVIOR WHILE HOLDING
                 # Strongly penalize trying to OPEN gripper unless at target
                 if dist_to_target > self.place_distance * 2.0:
                     # Still transporting - heavily penalize opening
@@ -546,7 +551,7 @@ class RingPickPlaceEnv(gym.Env):
                     if grip_action < -0.5:
                         reward += 1.0  # "Good! Release when at target!"
                 
-                # 10. SUCCESS - placed at target
+                # 11. SUCCESS - placed at target
                 if dist_to_target < self.place_distance:
                     reward += 100.0
                     done = True
@@ -595,6 +600,7 @@ class RingPickPlaceEnv(gym.Env):
     #   +0.1             per-step holding bonus
     #   +3.0 * Δdist     delta toward target
     #   +3.0 * exp(-3d)  exponential shaping toward target
+    #   -0.5*(|action|-0.7) smoothness penalty (no jerky movements)
     #   -2.0             penalty for opening grip during transport
     #   +1.0             bonus for opening grip at target
     #   +100.0           MASSIVE success bonus
@@ -603,8 +609,8 @@ class RingPickPlaceEnv(gym.Env):
     # KEY FIX:
     # - Distance shaping is NEGATIVE when far (>0.3m)
     # - Delta reward increased to 5.0 (dominates over shaping)
-    # - No more "do nothing far away" local optimum 
-
+    # - No more "do nothing far away" local optimum
+    # - Smoothness penalty while holding (prevents violent movements that break grip)
 
 
     def _get_obs(self):
