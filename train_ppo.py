@@ -5,7 +5,7 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize, VecMonitor
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.callbacks import CheckpointCallback, CallbackList, BaseCallback
-from pybullet_ring_env import RingPickPlaceEnv
+from pybullet_ring_env_ur5 import RingPickPlaceEnv
 
 MODEL_DIR = "models"
 LOG_DIR = "logs"
@@ -188,7 +188,7 @@ if __name__ == "__main__":
     # ============================================
     # SAVE FINAL MODEL
     # ============================================
-    model_path = os.path.join(MODEL_DIR, "ppo_stage1_final")
+    model_path = os.path.join(MODEL_DIR, "ppo_grap_v1")
     model.save(model_path)
     print(f"\nFinal model saved to: {model_path}")
 
