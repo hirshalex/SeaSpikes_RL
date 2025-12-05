@@ -19,6 +19,9 @@ import pybullet_data
 from gymnasium import spaces
 import gymnasium as gym
 
+# tensorboard logging
+from torch.utils.tensorboard import SummaryWriter
+
 # import robot class from repo
 ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(os.path.join(ROOT, "ur5_with_gripper"))
@@ -153,6 +156,11 @@ class RingPickPlaceEnv(gym.Env):
         self.observation_space = spaces.Box(-obs_high, obs_high, dtype=np.float32)
 
         self.seed()
+
+        # tensorboard logging writer
+        self.writer = SummaryWriter(log_dir="runs/env_rewards")
+        self.global_step = 0
+
 
     # ---------------- ROBOT & SCENE LOADING ----------------
     def _load_scene(self):
@@ -328,18 +336,31 @@ class RingPickPlaceEnv(gym.Env):
         elif mode == 'human':
             return None
 
-    # ---------------- stepping / grasping ----------------
+    # ---------------- GRASPING W/ UR5E GRIPPER ----------------
     def _attach_ring(self, ring_id):
-        if self.hold_constraint is None and ring_id is not None:
-            # attach ring rigidly to EE link
-            cid = p.createConstraint(parentBodyUniqueId=self.kuka,
-                                     parentLinkIndex=self.ee_link_index,
-                                     childBodyUniqueId=ring_id,
-                                     childLinkIndex=-1,
-                                     jointType=p.JOINT_FIXED,
-                                     jointAxis=[0,0,0],
-                                     parentFramePosition=[0,0,0],
-                                     childFramePosition=[0,0,0])
+            """
+            Create a fixed constraint ONLY AFTER a real grasp is detected.
+            This stabilizes the ring so PPO can lift it without physics jitter.
+            """
+            if self.holding:
+                return  # already holding something
+
+            # Safety: ensure ring id valid
+            if ring_id is None:
+                return
+
+            # Create constraint between EE link and the ring
+            cid = p.createConstraint(
+                parentBodyUniqueId=self.robot.id,
+                parentLinkIndex=self.ee_link_index,
+                childBodyUniqueId=ring_id,
+                childLinkIndex=-1,
+                jointType=p.JOINT_FIXED,
+                jointAxis=[0, 0, 0],
+                parentFramePosition=[0, 0, 0],
+                childFramePosition=[0, 0, 0]
+            )
+
             self.hold_constraint = cid
             self.holding = True
             self.held_ring_id = ring_id
@@ -348,11 +369,62 @@ class RingPickPlaceEnv(gym.Env):
         if self.hold_constraint is not None:
             try:
                 p.removeConstraint(self.hold_constraint)
-            except Exception:
+            except:
                 pass
-            self.hold_constraint = None
         self.holding = False
-        self.held_ring_id = None
+        self.hold_constraint = None
+    
+    def close(self):
+        p.disconnect(self.physics_client)
+    
+    def _is_grasped(self):
+        if self.holding:
+            return True
+
+        # ---------------------------------------------------
+        # 1. FINGER CLOSURE CHECK (Robotiq85 single joint)
+        # ---------------------------------------------------
+        finger_angle = p.getJointState(self.robot.id, self.robot.mimic_parent_id)[0]
+
+        # NOTE:
+        # When fully open → open_length = 0.085
+        # move_gripper() computes an angle from open_length:
+        # open_angle = 0.715 - asin((open_length - 0.010) / 0.1143)
+
+        closed_enough = finger_angle > 1.0   # threshold chosen from typical Robotiq angles
+
+        if not closed_enough:
+            return False
+
+        # ---------------------------------------------------
+        # 2. Identify NEAREST ring to EE
+        # ---------------------------------------------------
+        ee_pos = np.array(p.getLinkState(self.robot.id, self.ee_link_index)[0])
+
+        nearest_ring = None
+        nearest_d = float("inf")
+
+        for rid in self.ring_ids:
+            pos, _ = p.getBasePositionAndOrientation(rid)
+            d = np.linalg.norm(np.array(pos) - ee_pos)
+            if d < nearest_d:
+                nearest_d = d
+                nearest_ring = rid
+
+        if nearest_ring is None:
+            return False
+        
+        contacts = p.getContactPoints(bodyA=self.robot.id, bodyB=nearest_ring)
+        if len(contacts) == 0:
+            return False
+
+        # ---------------------------------------------------
+        # 3. GEOMETRIC ALIGNMENT CHECK
+        # ---------------------------------------------------
+        ring_pos = np.array(p.getBasePositionAndOrientation(nearest_ring)[0])
+        lateral_offset = abs(ring_pos[1] - ee_pos[1])
+
+        return lateral_offset < 0.03
 
     # ---------------- UTILITIES ----------------
     def seed(self, seed=None):
@@ -407,10 +479,21 @@ class RingPickPlaceEnv(gym.Env):
         Step the environment using:
         action = [dx, dy, dz, grip]   grip in [-1,1]
         Robot controlled through UR5Robotiq85.move_ee() and move_gripper().
+
+
+        This function handles:
+        1. Motion of the UR5e
+        2. Physics stepping
+        3. Gripper state machine (open/close intent smoothing)
+        4. Physics-based grasp detection (_is_grasped)
+        5. Attaching or releasing the ring
+        6. Reward computation
+        7. Tensorboard logging of reward components
+
         """
 
         # ----------------------------
-        #   INITIAL SETUP / TRACKERS
+        #   1. INITIAL SETUP / TRACKERS
         # ----------------------------
         if not hasattr(self, "prev_nearest_d"):
             self.prev_nearest_d = None
@@ -425,7 +508,7 @@ class RingPickPlaceEnv(gym.Env):
         self.step_count += 1
 
         # ----------------------------
-        #      PARSE ACTION
+        #      2. PARSE ACTION
         # ----------------------------
         action = np.clip(action, -1, 1)
         dx, dy, dz, grip_raw = action
@@ -440,10 +523,7 @@ class RingPickPlaceEnv(gym.Env):
         target_pos = ee_pos + delta
         target_pos = np.clip(target_pos, self.workspace_low, self.workspace_high)
 
-        # ------------------------------------
-        #     MOVE THE ROBOT USING robot.py
-        # ------------------------------------
-        # Orientation fixed downward (same as working repo)
+        # Orientation fixed downward (same as working repo that I took the robot.py from)
         target_orn = p.getQuaternionFromEuler([3.14, 0, 0])
 
         self.robot.move_ee([target_pos[0],
@@ -459,44 +539,32 @@ class RingPickPlaceEnv(gym.Env):
                 time.sleep(self.timestep)
 
         # ----------------------------
-        #   GRIPPER LOGIC (hysteresis)
+        #  3. PHYSICS BASED GRIPPER LOGIC FOR NEW GRIPPER IMPLEMENTATION
         # ----------------------------
         grip_close_th = 0.3
         grip_open_th  = -0.3
         grip_persist  = 3
         attached_now = False
 
-        # find nearest ring
-        ee_pos, _ = self.robot.get_ee_pose()
-        nearest_ring = None
-        nearest_d = 1e6
-
-        for rid in self.ring_ids:
-            try:
-                rpos, _ = p.getBasePositionAndOrientation(rid)
-                d = np.linalg.norm(np.array(rpos) - ee_pos)
-                if d < nearest_d:
-                    nearest_d = d
-                    nearest_ring = rid
-            except:
-                pass
-
-        # GRIP INTENT → STATE MACHINE
-        if grip_raw >= grip_close_th:       # Close
+        # hysteresis logic/state machine
+        if grip_raw >= grip_close_th:  # closing
             if not self.grip_state:
                 self.grip_counter += 1
                 if self.grip_counter >= grip_persist:
 
-                    if (not self.holding) and nearest_d < self.grasp_distance:
-                        self._attach_ring(nearest_ring)
-                        attached_now = True
+                    # NEW: Use physics-based grasp detection
+                    if (not self.holding) and self._is_grasped():
+                         if len(self.ring_ids) > 0:
+                            ring_id = self.ring_ids[0]
+                            self._attach_ring(ring_id)
+                            attached_now = True
 
                     self.grip_state = True
                     self.grip_counter = 0
             else:
                 self.grip_counter = 0
 
-        elif grip_raw <= grip_open_th:      # Open
+        elif grip_raw <= grip_open_th:  # opening
             if self.grip_state:
                 self.grip_counter += 1
                 if self.grip_counter >= grip_persist:
@@ -511,31 +579,46 @@ class RingPickPlaceEnv(gym.Env):
             self.grip_counter = 0
 
         # ----------------------------
-        #   APPLY GRIPPER COMMAND
+        #   4. APPLY REAL GRIPPER COMMAND
         # ----------------------------
-        # convert boolean grip_state → real jaw opening distance # SAME AS REPO FROM GITHUB W/ ROBOT.PY
-        # closed = 0.0, open = 0.085
+
+        # convert boolean grip_state → real jaw opening distance # SAME AS REPO FROM GITHUB W/ ROBOT.PY; closed = 0.0, open = 0.085
         jaw_opening = 0.085 if not self.grip_state else 0.0
         self.robot.move_gripper(jaw_opening)
 
-
         # ----------------------------
-        #   BUILD OBSERVATION
+        #   5. BUILD OBSERVATION
         # ----------------------------
         obs = self._get_obs()
 
         # ----------------------------
-        #   REWARD + SUCCESS LOGIC
+        #   6. REWARD + SUCCESS LOGIC
         # ----------------------------
         reward = 0.0
         done = False
         info = {}
+
+        # Compute nearest ring distance
+        ee_pos, _ = self.robot.get_ee_pose()
+        nearest_ring = None
+        nearest_d = 1e6
+
+        for rid in self.ring_ids:
+            try:
+                rpos, _ = p.getBasePositionAndOrientation(rid)
+                d = np.linalg.norm(np.array(rpos) - ee_pos)
+                if d < nearest_d:
+                    nearest_d = d
+                    nearest_ring = rid
+            except:
+                pass
 
         workspace_diag = np.linalg.norm(self.workspace_high - self.workspace_low) + 1e-8
 
         if self.prev_nearest_d is None:
             self.prev_nearest_d = nearest_d
 
+        # Reward coefficients
         coef_approach = 5.0
         coef_abs = -1.5
         grasp_bonus = 6.0
@@ -543,8 +626,9 @@ class RingPickPlaceEnv(gym.Env):
         holding_bonus = 0.05
 
         # ----------------------------
-        #   NOT HOLDING
+        #   6A. NOT HOLDING A RING — approach + grasp
         # ----------------------------
+  
         if not self.holding:
             delta_d = self.prev_nearest_d - nearest_d
             reward += coef_approach * (delta_d / workspace_diag)
@@ -557,7 +641,7 @@ class RingPickPlaceEnv(gym.Env):
                 reward += far_penalty
 
         # ----------------------------
-        #   HOLDING — bonus + placement
+        #  6B. HOLDING — bonus + placement
         # ----------------------------
         else:
             try:
@@ -590,6 +674,29 @@ class RingPickPlaceEnv(gym.Env):
 
         # update track
         self.prev_nearest_d = nearest_d
+
+        # -------------------------------------------
+        # 7. TENSORBOARD LOGGING (reward components)
+        # -------------------------------------------
+
+        self.writer.add_scalar("reward/total", reward, self.global_step)
+        self.writer.add_scalar("reward/nearest_ring_distance", nearest_d, self.global_step)
+        self.writer.add_scalar("reward/grip_state", int(self.grip_state), self.global_step)
+        self.writer.add_scalar("reward/attached_this_step", int(attached_now), self.global_step)
+        self.writer.add_scalar("reward/is_grasped_flag", int(self._is_grasped()), self.global_step)
+
+        # Only log placement distance if holding a ring
+        if self.holding:
+            try:
+                ring_pos, _ = p.getBasePositionAndOrientation(self.held_ring_id)
+                target = np.array(self.tentacle_top_positions[idx])
+                d_to_target = np.linalg.norm(np.array(ring_pos) - target)
+                self.writer.add_scalar("reward/ring_to_target", d_to_target, self.global_step)
+            except:
+                pass
+
+        # Increment step counter
+        self.global_step += 1
 
         return obs.astype(np.float32), float(reward), done, False, info   
 
