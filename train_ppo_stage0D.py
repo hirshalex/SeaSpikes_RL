@@ -13,9 +13,9 @@ os.makedirs(MODEL_DIR, exist_ok=True)
 os.makedirs(LOG_DIR, exist_ok=True)
 
 # Define file paths based on the completed Stage 0B
-MODEL_PATH_0B = os.path.join(MODEL_DIR, "ppo_stage0b_final.zip")
-VECNORM_PATH_0B = os.path.join(MODEL_DIR, "vecnormalize_stage0b.pkl")
-MODEL_PATH_0C = os.path.join(MODEL_DIR, "ppo_stage0c_final.zip")
+MODEL_PATH_0B = os.path.join(MODEL_DIR, "ppo_stage0c_final.zip")
+VECNORM_PATH_0B = os.path.join(MODEL_DIR, "vecnormalize_stage0c.pkl")
+MODEL_PATH_0C = os.path.join(MODEL_DIR, "ppo_stage0d_final.zip")
 
 
 class RewardLoggingCallback(BaseCallback):
@@ -52,7 +52,7 @@ def make_env_fn(num_tentacles=1, seed=None):
 
 if __name__ == "__main__":
     num_tentacles = 1
-    n_envs = 8 # Number of parallel environments
+    n_envs = 10 # Number of parallel environments
 
     # Create raw vectorized environment
     env_fns = [make_env_fn(num_tentacles=num_tentacles, seed=1000 + i)
@@ -63,7 +63,7 @@ if __name__ == "__main__":
     # LOAD VECNORM STATS FROM STAGE 0B
     # ============================================
     if not os.path.exists(VECNORM_PATH_0B):
-        raise FileNotFoundError(f"VecNormalize stats not found at {VECNORM_PATH_0B}. Run Stage 0B training first!")
+        raise FileNotFoundError(f"VecNormalize stats not found at {VECNORM_PATH_0B}. Run Stage 0C training first!")
 
     vec_env = VecNormalize.load(VECNORM_PATH_0B, train_env)
     vec_env.norm_reward = False 
@@ -74,7 +74,7 @@ if __name__ == "__main__":
     # LOAD POLICY FROM STAGE 0B CHECKPOINT
     # ============================================
     if not os.path.exists(MODEL_PATH_0B):
-        raise FileNotFoundError(f"Stage 0B model not found at {MODEL_PATH_0B}. Cannot bootstrap Stage 0C.")
+        raise FileNotFoundError(f"Stage 0C model not found at {MODEL_PATH_0B}. Cannot bootstrap Stage 0D.")
 
     print(f"Loading Stage 0B policy from: {MODEL_PATH_0B}")
     model = PPO.load(MODEL_PATH_0B, env=vec_env, tensorboard_log="./ppo_tb")
@@ -86,7 +86,7 @@ if __name__ == "__main__":
     print(f"Set model entropy coefficient (ent_coef) to: {new_ent_coef}")
 
     print("\n" + "=" * 60)
-    print("PPO TRAINING: STAGE 0C (FULL PICK & PLACE)")
+    print("PPO TRAINING: STAGE 0D (FULL PICK & PLACE)")
     print("Agent is trained to LIFT, MOVE, and PLACE.")
     print("Targeting 500k steps for full task convergence.")
     print("=" * 60)
@@ -95,7 +95,7 @@ if __name__ == "__main__":
     checkpoint_cb = CheckpointCallback(
         save_freq=100_000 // n_envs, 
         save_path=MODEL_DIR,
-        name_prefix="ppo_stage0c_ckpt",
+        name_prefix="ppo_stage0d_ckpt",
         verbose=1
     )
     reward_cb = RewardLoggingCallback()
@@ -116,10 +116,10 @@ if __name__ == "__main__":
 
     # SAVE FINAL MODEL
     model.save(MODEL_PATH_0C)
-    print(f"\nFinal Stage 0C model saved to: {MODEL_PATH_0C}")
+    print(f"\nFinal Stage 0D model saved to: {MODEL_PATH_0C}")
 
     # Save VecNormalize stats
-    vecsave_path = os.path.join(MODEL_DIR, "vecnormalize_stage0c.pkl")
+    vecsave_path = os.path.join(MODEL_DIR, "vecnormalize_stage0d.pkl")
     vec_env.save(vecsave_path)
     print(f"VecNormalize stats saved to: {vecsave_path}")
 

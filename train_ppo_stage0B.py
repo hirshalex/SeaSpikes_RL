@@ -1,4 +1,4 @@
-# train_ppo_stage0c.py - Training for Pick, Lift, and Place (Stage 0C)
+# train_ppo_stage0b.py - Training for Approach + Grasp (Stage 0B)
 import os
 import numpy as np
 from stable_baselines3 import PPO
@@ -12,11 +12,10 @@ LOG_DIR = "logs"
 os.makedirs(MODEL_DIR, exist_ok=True)
 os.makedirs(LOG_DIR, exist_ok=True)
 
-# Define file paths based on the completed Stage 0B
+# Define file paths based on the completed Stage 0A
+MODEL_PATH_0A = os.path.join(MODEL_DIR, "ppo_stage0a_final.zip")
+VECNORM_PATH_0A = os.path.join(MODEL_DIR, "vecnormalize_stage0a.pkl")
 MODEL_PATH_0B = os.path.join(MODEL_DIR, "ppo_stage0b_final.zip")
-VECNORM_PATH_0B = os.path.join(MODEL_DIR, "vecnormalize_stage0b.pkl")
-MODEL_PATH_0C = os.path.join(MODEL_DIR, "ppo_stage0c_final.zip")
-
 
 class RewardLoggingCallback(BaseCallback):
     """ Custom callback to log success rate. """
@@ -60,68 +59,67 @@ if __name__ == "__main__":
     train_env = DummyVecEnv(env_fns)
 
     # ============================================
-    # LOAD VECNORM STATS FROM STAGE 0B
+    # LOAD VECNORM STATS FROM STAGE 0A
     # ============================================
-    if not os.path.exists(VECNORM_PATH_0B):
-        raise FileNotFoundError(f"VecNormalize stats not found at {VECNORM_PATH_0B}. Run Stage 0B training first!")
+    if not os.path.exists(VECNORM_PATH_0A):
+        raise FileNotFoundError(f"VecNormalize stats not found at {VECNORM_PATH_0A}. Run Stage 0A training first!")
 
-    vec_env = VecNormalize.load(VECNORM_PATH_0B, train_env)
-    vec_env.norm_reward = False 
+    vec_env = VecNormalize.load(VECNORM_PATH_0A, train_env)
+    vec_env.norm_reward = False # Keep rewards unnormalized for this stage
 
     vec_env = VecMonitor(vec_env)
 
     # ============================================
-    # LOAD POLICY FROM STAGE 0B CHECKPOINT
+    # LOAD POLICY FROM STAGE 0A CHECKPOINT
     # ============================================
-    if not os.path.exists(MODEL_PATH_0B):
-        raise FileNotFoundError(f"Stage 0B model not found at {MODEL_PATH_0B}. Cannot bootstrap Stage 0C.")
+    if not os.path.exists(MODEL_PATH_0A):
+        raise FileNotFoundError(f"Stage 0A model not found at {MODEL_PATH_0A}. Cannot bootstrap Stage 0B.")
 
-    print(f"Loading Stage 0B policy from: {MODEL_PATH_0B}")
-    model = PPO.load(MODEL_PATH_0B, env=vec_env, tensorboard_log="./ppo_tb")
+    print(f"Loading Stage 0A policy from: {MODEL_PATH_0A}")
+    model = PPO.load(MODEL_PATH_0A, env=vec_env, tensorboard_log="./ppo_tb")
 
-    # Set Entropy and n_steps
-    model.n_steps = 2048
-    new_ent_coef = 0.03 # FURTHER DECREASE ENTROPY for high-precision placement
-    model.ent_coef = new_ent_coef
-    print(f"Set model entropy coefficient (ent_coef) to: {new_ent_coef}")
+    # Ensure the model continues training from the loaded state
+    model.n_steps = 2048 # Reset to desired n_steps if PPO object changed it
+
+    model.ent_coef = 0.05 
 
     print("\n" + "=" * 60)
-    print("PPO TRAINING: STAGE 0C (FULL PICK & PLACE)")
-    print("Agent is trained to LIFT, MOVE, and PLACE.")
-    print("Targeting 500k steps for full task convergence.")
+    print("PPO TRAINING: SUB-STAGE 0B (APPROACH + GRASP)")
+    print("BOOTSTRAPPING policy from Stage 0A expertise.")
+    print("Agent only needs to learn WHEN to close the gripper.")
     print("=" * 60)
 
     # Callbacks
     checkpoint_cb = CheckpointCallback(
-        save_freq=100_000 // n_envs, 
+        save_freq=100_000 // n_envs, # Less frequent checkpoints, we only need to learn the final move
         save_path=MODEL_DIR,
-        name_prefix="ppo_stage0c_ckpt",
+        name_prefix="ppo_stage0b_ckpt",
         verbose=1
     )
     reward_cb = RewardLoggingCallback()
     callback = CallbackList([checkpoint_cb, reward_cb])
 
     # TRAIN
-    # 500k steps should be enough to converge from the B-Stage expertise
-    total_timesteps = 800_000 
+    # Start with 200k steps, the agent should converge faster since it knows how to approach
+    total_timesteps = 500_000 
     
     try:
         model.learn(
             total_timesteps=total_timesteps, 
             callback=callback,
-            reset_num_timesteps=False 
+            reset_num_timesteps=False # IMPORTANT: Continues step count from loaded model
         )
     except KeyboardInterrupt:
         print("\n\nTraining interrupted by user. Saving current model...")
 
     # SAVE FINAL MODEL
-    model.save(MODEL_PATH_0C)
-    print(f"\nFinal Stage 0C model saved to: {MODEL_PATH_0C}")
+    model.save(MODEL_PATH_0B)
+    print(f"\nFinal Stage 0B model saved to: {MODEL_PATH_0B}")
 
-    # Save VecNormalize stats
-    vecsave_path = os.path.join(MODEL_DIR, "vecnormalize_stage0c.pkl")
+    # Save VecNormalize stats (optional, but good practice)
+    vecsave_path = os.path.join(MODEL_DIR, "vecnormalize_stage0b.pkl")
     vec_env.save(vecsave_path)
     print(f"VecNormalize stats saved to: {vecsave_path}")
 
     vec_env.close()
-    print("\nStage 0C Training complete! You have achieved the single-ring task.")
+    print("\nStage 0B Training complete! Next step: Stage 1 (Lift & Move)")

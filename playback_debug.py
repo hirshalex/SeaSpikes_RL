@@ -1,4 +1,4 @@
-# debug_playback.py - See what the agent is actually doing
+# debug_playback.py - See what the agent is actually doing (IMPROVED)
 import os
 import time
 import numpy as np
@@ -9,8 +9,8 @@ from pybullet_ring_env_ur5 import RingPickPlaceEnv
 import pybullet as p
 
 MODEL_DIR = "models"
-model_path = os.path.join(MODEL_DIR, "ppo_stage0c_final.zip")
-vec_path = os.path.join(MODEL_DIR, "vecnormalize_stage0c.pkl")
+model_path = os.path.join(MODEL_DIR, "ppo_stage0d_final.zip")
+vec_path = os.path.join(MODEL_DIR, "vecnormalize_stage0d.pkl")
 
 def make_gui_env():
     def _init():
@@ -35,128 +35,151 @@ if __name__ == "__main__":
         raise FileNotFoundError(f"Model not found: {model_path}")
 
     print("=" * 60)
-    print("DEBUG PLAYBACK - Detailed Agent Behavior Analysis")
+    print("DEBUG PLAYBACK - Full Agent Behavior Analysis")
     print("=" * 60)
-    print("Watch for:")
-    print("  - Is the gripper action ever positive (trying to close)?")
-    print("  - Does distance to ring decrease over time?")
-    print("  - Does the agent ever get close enough to grasp?")
-    print("=" * 60)
+
 
     obs = env.reset()
 
-    # Get access to underlying env for debug info
-    base_env = env.envs[0].env
+    base_env = env.envs[0].env  # underlying PyBullet env
 
     episode = 0
     step = 0
     ep_reward = 0
-    
-    # Track gripper state changes for diagnosis
+
     was_holding = False
 
     try:
-        while episode < 3:  # Run 3 episodes
+        while episode < 3:
             action, _ = model.predict(obs, deterministic=True)
-            
-            # EXTRACT RAW ACTION VALUES
-            raw_action = action[0]  # Get first env's action
+            raw_action = action[0]
+
             dx, dy, dz, grip = raw_action
-            
+
             obs, reward, done, infos = env.step(action)
-            
+
             done = done[0]
             reward_val = float(reward[0])
             ep_reward += reward_val
 
-            # GET DEBUG INFO FROM ENVIRONMENT
+            # ===============================
+            # Collect core environment info
+            # ===============================
             ee_pos, _ = base_env._get_ee_pose()
-            
-            # Find nearest ring
-            nearest_d = 1e6
+
+            # Ring info
+            ring_d = 1e6
+            ring_pos = None
             if base_env.ring_ids:
                 ring_pos, _ = p.getBasePositionAndOrientation(base_env.ring_ids[0])
-                nearest_d = np.linalg.norm(np.array(ring_pos) - ee_pos)
-            
+                ring_pos = np.array(ring_pos)
+                ring_d = np.linalg.norm(ring_pos - ee_pos)
+
+            # Tentacle info
+            tentacle_top = None
+            tentacle_d = None
+            if base_env.tentacle_top_positions:
+                tentacle_top = np.array(base_env.tentacle_top_positions[0])
+                tentacle_d = np.linalg.norm(ee_pos - tentacle_top)
+
+            # Ring → Tentacle distance (useful when holding)
+            ring_to_tentacle_d = None
+            if (ring_pos is not None) and (tentacle_top is not None):
+                ring_to_tentacle_d = np.linalg.norm(ring_pos - tentacle_top)
+
             holding = base_env.holding
-            
-            # ============================================
-            # GRIPPER STATE CHANGE DETECTION
-            # ============================================
+
+            # ====================================================
+            # Detect grasp or drop transitions (holding changes)
+            # ====================================================
             if holding and not was_holding:
                 print(f"\n{'='*60}")
-                print(f"[GRASP] Step {step}: Successfully attached ring!")
+                print(f"[GRASP] Step {step}: Ring successfully attached!")
                 print(f"  Grip action: {grip:.3f}")
-                print(f"  Distance when grasped: {nearest_d:.3f}")
+                print(f"  EE→Ring distance at grasp: {ring_d:.3f}")
                 print(f"{'='*60}\n")
-            
+
             if was_holding and not holding:
                 print(f"\n{'='*60}")
                 if grip < -0.5:
                     print(f"[RELEASE] Step {step}: Intentional release")
-                    print(f"  Grip action: {grip:.3f} (trying to open)")
                 else:
-                    print(f"[DROP] Step {step}: ACCIDENTAL DROP!")
-                    print(f"  Grip action: {grip:.3f} (NOT trying to open)")
-                    print(f"  Action magnitude: {np.linalg.norm([dx, dy, dz]):.3f}")
-                    print(f"  → Likely cause: {'Jerky movement broke physics' if np.linalg.norm([dx, dy, dz]) > 0.7 else 'Gripper logic issue'}")
+                    print(f"[DROP] Step {step}: ACCIDENTAL drop!")
+                print(f"  Grip action: {grip:.3f}")
+                print(f"  EE→Ring dist at drop: {ring_d:.3f}")
                 print(f"{'='*60}\n")
-            
+
             was_holding = holding
-            
-            # Print detailed info every 20 steps
+
+            # ====================================================
+            # DETAILED DEBUG EVERY 20 STEPS
+            # ====================================================
             if step % 20 == 0:
                 print(f"\n--- Step {step} ---")
                 print(f"  Action: dx={dx:.3f}, dy={dy:.3f}, dz={dz:.3f}, grip={grip:.3f}")
                 print(f"  Action magnitude: {np.linalg.norm([dx, dy, dz]):.3f}")
-                print(f"  EE Position: [{ee_pos[0]:.3f}, {ee_pos[1]:.3f}, {ee_pos[2]:.3f}]")
-                print(f"  Distance to ring: {nearest_d:.3f}")
-                print(f"  Holding: {holding}")
-                print(f"  Reward: {reward_val:.3f}")
-                print(f"  Cumulative reward: {ep_reward:.2f}")
-                
-                # DIAGNOSE ISSUES
-                if abs(grip) < 0.3:
-                    print(f"  ⚠️  Gripper action is neutral (not trying to grasp or release)")
-                if grip > 0.5:
-                    print(f"  ✓ Trying to CLOSE gripper")
-                    if nearest_d > base_env.grasp_distance:
-                        print(f"    ❌ But too far from ring (need < {base_env.grasp_distance:.3f})")
-                if grip < -0.5:
-                    print(f"  ✓ Trying to OPEN gripper")
-                    if holding:
-                        print(f"    ⚠️  Opening while holding (will drop ring)")
-                
-                if holding:
-                    action_mag = np.linalg.norm([dx, dy, dz])
-                    if action_mag > 0.7:
-                        print(f"  ⚠️  Large action while holding ({action_mag:.3f}) - risk of dropping!")
-                
-                if nearest_d > 0.3:
-                    print(f"  ⚠️  Agent is far from ring - approach phase failing")
-                elif nearest_d < base_env.grasp_distance and not holding:
-                    print(f"  ✓ In grasp range! Should try to close gripper")
 
+                print(f"  EE Position: [{ee_pos[0]:.3f}, {ee_pos[1]:.3f}, {ee_pos[2]:.3f}]")
+
+                print(f"  EE → Ring distance: {ring_d:.3f}")
+                if tentacle_d is not None:
+                    print(f"  EE → Tentacle distance: {tentacle_d:.3f}")
+                if ring_to_tentacle_d is not None:
+                    print(f"  Ring → Tentacle distance: {ring_to_tentacle_d:.3f}")
+
+                print(f"  Holding ring: {holding}")
+                print(f"  Reward this step: {reward_val:.3f}")
+                print(f"  Episode cumulative reward: {ep_reward:.2f}")
+
+                # --- Diagnostics ---
+                if not holding:
+                    if ring_d > 0.3:
+                        print("  ⚠️  Far from ring — approach failing.")
+                    elif ring_d < base_env.grasp_distance:
+                        print("  ✓ In grasp range — should close soon.")
+                    if grip > 0.5:
+                        print("    ✓ Attempting to CLOSE gripper")
+                    elif abs(grip) < 0.3:
+                        print("    ⚠️ Neutral grip — not trying to grasp")
+                else:
+                    # When holding:
+                    if ring_to_tentacle_d is not None:
+                        if ring_to_tentacle_d > 0.2:
+                            print("  ⚠️  Far from tentacle — placement phase failing")
+                        else:
+                            print("  ✓ Close to tentacle — should OPEN soon")
+
+                    if grip < -0.5:
+                        print("    ✓ Attempting to OPEN gripper (placement)")
+                    elif abs(grip) < 0.3:
+                        print("    ⚠️ Neutral grip while holding — no intent to release yet")
+
+            # ====================================================
+            # Episode termination
+            # ====================================================
             if done:
                 info = infos[0]
                 success = info.get('success', False)
+
                 print(f"\n{'='*60}")
-                print(f"EPISODE {episode + 1} FINISHED")
+                print(f"EPISODE {episode+1} FINISHED")
                 print(f"  Total steps: {step}")
-                print(f"  Total reward: {ep_reward:.2f}")
+                print(f"  Episode reward: {ep_reward:.2f}")
                 print(f"  Success: {success}")
                 print(f"{'='*60}\n")
-                
+
                 obs = env.reset()
                 episode += 1
                 step = 0
                 ep_reward = 0
-                time.sleep(2)
+                time.sleep(1)
+
             else:
                 step += 1
 
     except KeyboardInterrupt:
         print("\nPlayback interrupted by user")
+
     finally:
         env.close()
         print("Closed env")

@@ -73,7 +73,7 @@ class RingPickPlaceEnv(gym.Env):
     def __init__(self,
                  gui=False,
                  timestep=1/240.,
-                 frame_skip=4,
+                 frame_skip=2,
                  num_tentacles=1,
                  max_tentacles=10,
                  base_circle_radius=0.18,
@@ -128,10 +128,10 @@ class RingPickPlaceEnv(gym.Env):
         self.holding = False
         self.hold_constraint = None
         self.held_ring_id = None
-        self.max_delta = 0.02
+        self.max_delta = 0.01
         self.grasp_distance = 0.2
         self.place_distance = 0.2
-        self.success_reward = 5.0
+        self.success_reward = 1000.0
         self.spawn_zone_center = np.array([0.35, -0.35, 0.06])
         self.spawn_zone_size = np.array([0.1, 0.2, 0.02])
 
@@ -304,9 +304,10 @@ class RingPickPlaceEnv(gym.Env):
         Returns body id and position.
         """
         # sample a random offset in spawn zone
-        offs = np.array([self.np_random.uniform(-0.5, 0.5) * self.spawn_zone_size[0],
-                         self.np_random.uniform(-0.5, 0.5) * self.spawn_zone_size[1],
-                         0.0])
+        offs = np.array([0.0, 0.0, 0.0])
+        # offs = np.array([self.np_random.uniform(-0.5, 0.5) * self.spawn_zone_size[0],
+        #                  self.np_random.uniform(-0.5, 0.5) * self.spawn_zone_size[1],
+        #                  0.0])
         pos = spawn_center + offs
         pos[2] = max(pos[2], 0.04)
         # create visual and collision (mesh)
@@ -521,6 +522,7 @@ class RingPickPlaceEnv(gym.Env):
             if not hasattr(self, "step_count"): self.step_count = 0
             if not hasattr(self, "prev_nearest_d_ring"): self.prev_nearest_d_ring = None
             if not hasattr(self, "prev_nearest_d_tentacle"): self.prev_nearest_d_tentacle = None
+            if not hasattr(self, "prev_ring_to_tentacle"): self.prev_ring_to_tentacle = None
             
             self.step_count += 1
 
@@ -583,19 +585,23 @@ class RingPickPlaceEnv(gym.Env):
             if not self.holding:
                 # 1. Inverse Distance Penalty (R_State)
                 # Penalizes distance to provide a stable value gradient
-                reward_scale = 30.0 # Tune this magnitude
+                reward_scale = 25.0 # Tune this magnitude
                 reward += -reward_scale * nearest_d_ring
 
 
                 # 3. Success Bonus (R_Success)
                 if nearest_d_ring < 0.2:
-                    reward += 50.0
+                    reward += 20.0
 
-                grip_bonus_scale = 40.0 
+                grip_bonus_scale = 50.0 
+
+                if (nearest_d_ring < self.grasp_distance * 2) and (grip_action > .5):
+                     reward += 30    # shaping reward BEFORE success
+
                 if nearest_d_ring < self.grasp_distance:
                     # We want to reward positive grip actions (closing) proportionally.
                     # Use max(0, grip_action) to ensure we don't reward opening.
-                    reward += grip_bonus_scale * np.clip(grip_action, 0, 1)
+                    reward += grip_bonus_scale * np.clip(grip_action, -1, 1)
                 
                 # 4. BONUS: HUGE bonus for successful grasp (R_Grasp)
                 if grasped_this_step:
@@ -603,34 +609,31 @@ class RingPickPlaceEnv(gym.Env):
                     info['grasped'] = True
 
             if self.holding:
-                # 1. Distance Reduction Reward (R_Hold_Distance)
-                # Reward based on reduction in distance to tentacle top
-                reward_scale = 50.0 # Tune this magnitude
-                reward += -reward_scale * d_ee_to_tentacle
+                # Calculate distance from ring to tentacle top
+                ring_pos, _ = p.getBasePositionAndOrientation(self.ring_ids[0])
+                ring_pos = np.array(ring_pos)
+                d_ring_to_tentacle = np.linalg.norm(ring_pos - tentacle_top_pos)
 
-                if d_ee_to_tentacle < self.place_distance:
+                # 1. Inverse Distance Penalty to Tentacle Top (R_Hold_State)
+                reward_scale = 75.0 # Tune this magnitude
+                reward += -reward_scale * d_ring_to_tentacle
+
+                # Distance bonus to stay close to tentacle top
+                distance_bonus_scale = 100.0
+                if d_ring_to_tentacle < 0.2:
+                    reward += distance_bonus_scale * (0.2 - d_ring_to_tentacle)
+                
+
+                # 2. Success Bonus for being close to tentacle top (R_Hold_Success)
+                if d_ring_to_tentacle < 0.10:    
                     reward += 100.0
+                
+                # 3. HUGE BONUS for successful placement (R_Place)
+                if self._is_ring_placed():
+                    reward += self.success_reward
+                    done = True
+                    info['placed'] = True
 
-                # grip_bonus_scale = 40.0 
-                # if d_ee_to_tentacle > self.place_distance:
-                #     # We want to reward positive grip actions (closing) proportionally.
-                #     # Use max(0, grip_action) to ensure we don't reward opening.
-                #     reward += grip_bonus_scale * np.clip(grip_action, -1, 0)
-
-                # if d_ee_to_tentacle < self.place_distance:
-                #     # We want to reward positive grip actions (closing) proportionally.
-                #     # Use max(0, grip_action) to ensure we don't reward opening.
-                #     reward += -grip_bonus_scale * np.clip(grip_action, -1, 0)
-
-                # # 2. Success Bonus for Placement (R_Place_Success)
-                # if self._is_ring_placed():
-                #     reward += 2000.0
-                #     done = True
-                #     info['success'] = True
-                #     info['placed'] = True
-
-            # Update tracker
-            self.prev_nearest_d = nearest_d_ring
             
             # Build observation
             obs = self._get_obs()
@@ -686,6 +689,10 @@ class RingPickPlaceEnv(gym.Env):
         self._load_scene()
 
         # clear bookkeeping
+        # in reset():
+        self._holding_increase_count = 0
+        self.prev_ring_to_tentacle = None
+
         self.tentacle_ids = []
         self.tentacle_top_positions = []
         self.tentacle_color_idxs = []
