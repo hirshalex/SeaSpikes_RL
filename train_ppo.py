@@ -5,7 +5,8 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize, VecMonitor
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.callbacks import CheckpointCallback, CallbackList, BaseCallback
-from pybullet_ring_env import RingPickPlaceEnv
+#from pybullet_ring_env import RingPickPlaceEnv
+from pybullet_ring_env_ur5 import RingPickPlaceEnv
 
 MODEL_DIR = "models"
 LOG_DIR = "logs"
@@ -119,8 +120,8 @@ if __name__ == "__main__":
         gamma=0.99,             # Keep this
         
         # Exploration - START HIGHER, will naturally decay
-        ent_coef=0.05,          # Increased from 0.01 for more initial exploration
-                                # With better rewards, agent needs more exploration to discover grasp
+        ent_coef=0.15,           # INCREASED from 0.05 - MAXIMUM exploration
+                                # With pure delta rewards, we NEED exploration
         
         # Value function coefficient (helps with learning value estimates)
         vf_coef=0.5,            # Default but explicit
@@ -141,7 +142,7 @@ if __name__ == "__main__":
     print(f"  Steps per rollout: {2048 * n_envs} ({2048} per env × {n_envs})")
     print(f"  Batch size: 128")
     print(f"  Updates per rollout: 10")
-    print(f"  Entropy coefficient: 0.05 (high exploration)")
+    print(f"  Entropy coefficient: 0.1 (MAXIMUM exploration)")
     print(f"  Learning rate: 3e-4")
     print("=" * 60)
     print("\nMonitor training progress:")
@@ -174,7 +175,7 @@ if __name__ == "__main__":
     # ============================================
     # TRAIN
     # ============================================
-    total_timesteps = 3_000_000
+    total_timesteps = 1_000_000
     
     try:
         model.learn(
