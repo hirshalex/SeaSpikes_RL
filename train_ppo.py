@@ -189,7 +189,7 @@ if __name__ == "__main__":
     # ============================================
     # SAVE FINAL MODEL
     # ============================================
-    model_path = os.path.join(MODEL_DIR, "ppo_stage1_final")
+    model_path = os.path.join(MODEL_DIR, "ppo_grap_v1")
     model.save(model_path)
     print(f"\nFinal model saved to: {model_path}")
 

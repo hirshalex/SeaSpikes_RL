@@ -22,6 +22,9 @@ import pybullet_data
 from gymnasium import spaces
 import gymnasium as gym
 
+# tensorboard logging
+from torch.utils.tensorboard import SummaryWriter
+
 # import robot class from repo
 ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(ROOT, "ur5_with_gripper")) 
@@ -157,6 +160,11 @@ class RingPickPlaceEnv(gym.Env):
         self.observation_space = spaces.Box(-obs_high, obs_high, dtype=np.float32)
 
         self.seed()
+
+        # tensorboard logging writer
+        self.writer = SummaryWriter(log_dir="runs/env_rewards")
+        self.global_step = 0
+
 
     # ---------------- ROBOT & SCENE LOADING ----------------
     def _load_scene(self):
@@ -334,19 +342,31 @@ class RingPickPlaceEnv(gym.Env):
         elif mode == 'human':
             return None
 
-    # ---------------- stepping / grasping ----------------
+    # ---------------- GRASPING W/ UR5E GRIPPER ----------------
     def _attach_ring(self, ring_id):
-        if self.hold_constraint is None and ring_id is not None:
+            """
+            Create a fixed constraint ONLY AFTER a real grasp is detected.
+            This stabilizes the ring so PPO can lift it without physics jitter.
+            """
+            if self.holding:
+                return  # already holding something
+
+            # Safety: ensure ring id valid
+            if ring_id is None:
+                return
+
+            # Create constraint between EE link and the ring
             cid = p.createConstraint(
-                parentBodyUniqueId=self.robot.id,  
+                parentBodyUniqueId=self.robot.id,
                 parentLinkIndex=self.ee_link_index,
                 childBodyUniqueId=ring_id,
                 childLinkIndex=-1,
                 jointType=p.JOINT_FIXED,
-                jointAxis=[0,0,0],
-                parentFramePosition=[0,0,0],
-                childFramePosition=[0,0,0]
+                jointAxis=[0, 0, 0],
+                parentFramePosition=[0, 0, 0],
+                childFramePosition=[0, 0, 0]
             )
+
             self.hold_constraint = cid
             self.holding = True
             self.held_ring_id = ring_id
@@ -355,11 +375,62 @@ class RingPickPlaceEnv(gym.Env):
         if self.hold_constraint is not None:
             try:
                 p.removeConstraint(self.hold_constraint)
-            except Exception:
+            except:
                 pass
-            self.hold_constraint = None
         self.holding = False
-        self.held_ring_id = None
+        self.hold_constraint = None
+    
+    def close(self):
+        p.disconnect(self.physics_client)
+    
+    def _is_grasped(self):
+        if self.holding:
+            return True
+
+        # ---------------------------------------------------
+        # 1. FINGER CLOSURE CHECK (Robotiq85 single joint)
+        # ---------------------------------------------------
+        finger_angle = p.getJointState(self.robot.id, self.robot.mimic_parent_id)[0]
+
+        # NOTE:
+        # When fully open → open_length = 0.085
+        # move_gripper() computes an angle from open_length:
+        # open_angle = 0.715 - asin((open_length - 0.010) / 0.1143)
+
+        closed_enough = finger_angle > 1.0   # threshold chosen from typical Robotiq angles
+
+        if not closed_enough:
+            return False
+
+        # ---------------------------------------------------
+        # 2. Identify NEAREST ring to EE
+        # ---------------------------------------------------
+        ee_pos = np.array(p.getLinkState(self.robot.id, self.ee_link_index)[0])
+
+        nearest_ring = None
+        nearest_d = float("inf")
+
+        for rid in self.ring_ids:
+            pos, _ = p.getBasePositionAndOrientation(rid)
+            d = np.linalg.norm(np.array(pos) - ee_pos)
+            if d < nearest_d:
+                nearest_d = d
+                nearest_ring = rid
+
+        if nearest_ring is None:
+            return False
+        
+        contacts = p.getContactPoints(bodyA=self.robot.id, bodyB=nearest_ring)
+        if len(contacts) == 0:
+            return False
+
+        # ---------------------------------------------------
+        # 3. GEOMETRIC ALIGNMENT CHECK
+        # ---------------------------------------------------
+        ring_pos = np.array(p.getBasePositionAndOrientation(nearest_ring)[0])
+        lateral_offset = abs(ring_pos[1] - ee_pos[1])
+
+        return lateral_offset < 0.03
 
     # ---------------- UTILITIES ----------------
     def seed(self, seed=None):
