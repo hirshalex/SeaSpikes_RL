@@ -5,12 +5,12 @@ import numpy as np
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from stable_baselines3.common.monitor import Monitor
-from pybullet_ring_env import RingPickPlaceEnv
+from pybullet_ring_env_ur5 import RingPickPlaceEnv
 import pybullet as p
 
 MODEL_DIR = "models"
-model_path = os.path.join(MODEL_DIR, "ppo_stage1_final.zip")
-vec_path = os.path.join(MODEL_DIR, "vecnormalize_stage1.pkl")
+model_path = os.path.join(MODEL_DIR, "ppo_stage0c_final.zip")
+vec_path = os.path.join(MODEL_DIR, "vecnormalize_stage0c.pkl")
 
 def make_gui_env():
     def _init():
