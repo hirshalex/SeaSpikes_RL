@@ -52,7 +52,7 @@ def make_env_fn(num_tentacles=1, seed=None):
 
 if __name__ == "__main__":
     num_tentacles = 1
-    n_envs = 10 # Number of parallel environments
+    n_envs = 12 # Number of parallel environments
 
     # Create raw vectorized environment
     env_fns = [make_env_fn(num_tentacles=num_tentacles, seed=1000 + i)
@@ -103,7 +103,7 @@ if __name__ == "__main__":
 
     # TRAIN
     # 500k steps should be enough to converge from the B-Stage expertise
-    total_timesteps = 800_000 
+    total_timesteps = 3_000_000 
     
     try:
         model.learn(
